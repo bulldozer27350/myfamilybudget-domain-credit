@@ -32,6 +32,14 @@
         <japicmp-maven-plugin.version>0.23.1</japicmp-maven-plugin.version>
     </properties>
 
+    <repositories>
+        <repository>
+            <id>mfb-packages</id>
+            <name>GitHub Packages MyFamilyBudget (BOM)</name>
+            <url>https://maven.pkg.github.com/bulldozer27350/MyFamilyBudget</url>
+        </repository>
+    </repositories>
+
     <dependencyManagement>
         <dependencies>
             <!-- BOM centralisé MyFamilyBudget -->

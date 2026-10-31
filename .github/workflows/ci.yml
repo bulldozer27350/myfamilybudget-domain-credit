@@ -21,7 +21,26 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
           cache: 'maven'
-          server-id: 'github'
+
+      - name: Configuration de Maven settings.xml (lecture du BOM MyFamilyBudget + publication du silo)
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<EOF
+          <settings>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${{ github.actor }}</username>
+                <password>${{ secrets.GITHUB_TOKEN }}</password>
+              </server>
+              <server>
+                <id>mfb-packages</id>
+                <username>${{ github.actor }}</username>
+                <password>${{ secrets.MFB_PACKAGES_READ_TOKEN }}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
 
       - name: Build et Tests du Silo
         run: mvn --batch-mode clean verify
@@ -44,9 +63,26 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
           cache: 'maven'
-          server-id: 'github'
+
+      - name: Configuration de Maven settings.xml (lecture du BOM MyFamilyBudget + publication du silo)
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<EOF
+          <settings>
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${{ github.actor }}</username>
+                <password>${{ secrets.GITHUB_TOKEN }}</password>
+              </server>
+              <server>
+                <id>mfb-packages</id>
+                <username>${{ github.actor }}</username>
+                <password>${{ secrets.MFB_PACKAGES_READ_TOKEN }}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
 
       - name: Déploiement des artefacts sur GitHub Packages
         run: mvn --batch-mode deploy -DskipTests
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
