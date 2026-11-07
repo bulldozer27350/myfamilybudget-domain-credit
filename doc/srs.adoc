@@ -1,0 +1,646 @@
+////
+Fragment AsciiDoc destiné à être inclus par le document maître applicatif de MyFamilyBudget via
+include::{...}/myfamilybudget-domain-credit/doc/srs.adoc[leveloffset=+N], N étant ajusté par ce
+document maître. Ne pas transformer ce fichier en document autonome (pas de titre de niveau 0).
+////
+
+== Silo Crédit — Exigences fonctionnelles et non fonctionnelles
+
+=== Conventions
+
+Les identifiants de ce document suivent la convention commune à l'ensemble de l'application
+MyFamilyBudget (préfixe `MFB-`, commun aux 11 dépôts satellites, pour une concaténation homogène
+des exigences entre dépôts) :
+
+* `MFB-CRE-RF-nnn` : exigence fonctionnelle (comportement observable en boîte noire via l'un des
+  points d'entrée du silo Crédit — le moteur de conseil sur les prêts ou les ports de persistance
+  qu'il expose).
+* `MFB-CRE-NRF-nnn` : exigence non fonctionnelle (attribut de conception, de qualité ou de cycle
+  de vie — isolement architectural, build, modularité, versionnage...).
+* `nnn` est un numéro séquentiel sur 3 chiffres, sans trou ni réutilisation, contigu par
+  catégorie (001, 002...).
+
+Critère de classement RF vs NRF : le critère est la **nature** de l'exigence, pas sa facilité de
+test. Une exigence RF décrit un comportement métier (une entrée donnée produit une sortie
+donnée) ; une exigence NRF décrit un attribut de conception ou de qualité. Une exigence non
+testable par exécution directe n'est pas pour autant à écarter : elle est vérifiée par une autre
+méthode et classée selon sa nature propre, pas selon la méthode disponible pour la prouver.
+
+Chaque exigence précise comment elle peut être prouvée, selon la nomenclature suivante :
+
+* *Inspection* : lecture directe d'un artefact (code, `pom.xml`, configuration, type Java) sans
+  exécution.
+* *Analyse* : raisonnement ou outillage statique sur le code ou le compilé (graphe de
+  dépendances, comparaison binaire type japicmp, règle d'architecture type ArchUnit), sans
+  exercer le comportement avec des données représentatives.
+* *Démonstration* : exécution de l'ensemble ou du pipeline en conditions représentatives,
+  observation qualitative, sans assertion exhaustive sur des données de test précises.
+* *Test* : exécution contrôlée avec des données connues, comparaison quantitative du résultat à
+  un résultat attendu.
+
+=== Contrat d'entrée de l'analyse des prêts
+
+[#MFB-CRE-RF-001]
+==== MFB-CRE-RF-001 — Normalisation des champs absents du contrat d'entrée
+
+Quand `LoanAdviceInput` est construit avec `loans` ou `alternatives` à `null`, ces champs sont
+remplacés par une liste vide. Quand `parameters` est `null`, il est remplacé par
+`LoanAdviceParameters.defaults(null)`.
+
+Vérification:: Test — `LoanAdviceInputTest.testDefaults()`.
+
+Amont:: RF-800 (voir le Javadoc de `LoanAdviceInput`, qui renvoie à
+doc/architecture/10-domaine-prets-suggestions.md du dépôt MyFamilyBudget, historique
+pré-extraction).
+
+[#MFB-CRE-RF-002]
+==== MFB-CRE-RF-002 — Date de référence obligatoire pour l'analyse
+
+La construction d'un `LoanAdviceInput` sans date de référence (`today` nul) échoue
+immédiatement avec une `NullPointerException` : aucune analyse n'est possible sans date de
+référence explicite (calcul reproductible).
+
+Vérification:: Test — `LoanAdviceInputTest.testTodayIsRequired()`.
+
+Amont:: RF-800 (doc/architecture/10-domaine-prets-suggestions.md).
+
+[#MFB-CRE-RF-003]
+==== MFB-CRE-RF-003 — Valeurs par défaut des hypothèses de l'analyse
+
+Sans hypothèses fournies, `LoanAdviceParameters.defaults(marketRate)` retourne : écart de
+remboursement 0,5 % (`repayMarginRate`), écart minimal de renégociation 0,7 %
+(`renegotiationMinGapRate`), capital restant dû minimal de renégociation 70 000 €
+(`renegotiationMinCrd`), durée restante minimale de renégociation 84 mois
+(`renegotiationMinRemainingMonths`), frais fixes de renégociation 1 500 €
+(`renegotiationFixedCosts`) et fiscalité des placements liquides hors livrets (PFU) de 30 %
+(`flatTaxRate`). Le taux de marché transmis en paramètre est repris tel quel (`null` si absent).
+
+NOTE: Ces valeurs sont des heuristiques de courtiers, pas des règles universelles : elles sont
+exposées dans `LoanAdviceResultModel.Assumptions` pour que l'utilisateur sache sur quoi repose
+chaque verdict (voir MFB-CRE-RF-019).
+
+Vérification:: Test — `DefaultLoanAdviceSettingsServiceTest.defaultsWhenNothingSaved()` (passe
+par `LoanAdviceSettingsService.current()`, qui délègue à `defaults()` en l'absence
+d'enregistrement).
+
+Amont:: Aucune (exigence propre à ce dépôt).
+
+=== Résolution du taux de marché et de l'alternative de placement
+
+[#MFB-CRE-RF-004]
+==== MFB-CRE-RF-004 — Priorité du taux de marché fourni par l'appelant
+
+Lors du calcul, le taux de marché effectivement utilisé est `input.marketRate()` s'il est
+renseigné, sinon `parameters.marketRate()`. Un taux de marché saisi en hypothèse n'est donc
+utilisé que si l'appelant ne fournit pas de taux plus précis pour cette analyse (ex. simulation
+ponctuelle).
+
+Vérification:: Inspection — `DefaultLoanAdviceCalculationService.compute()`, ligne de résolution
+`market = input.marketRate() != null ? input.marketRate() : params.marketRate()`. Aucun test
+dédié actuellement ; les tests existants de `DefaultLoanAdviceCalculationServiceComponentTest`
+passent `marketRate` à `null` et n'exercent donc que la branche de repli.
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+[#MFB-CRE-RF-005]
+==== MFB-CRE-RF-005 — Rejet du taux de marché hors plage plausible
+
+Un taux de marché résolu (MFB-CRE-RF-004) inférieur ou égal à 0 %, ou strictement supérieur à
+30 % (`LoanAdviceParameters.MAX_PLAUSIBLE_MARKET_RATE`), est ignoré : il n'est pas utilisé pour
+l'analyse de renégociation, une note explicative est ajoutée au résultat
+(« Taux de marché ignoré : valeur hors de la plage plausible (0 % à 30 %). »), et
+`marketRateUsed` du résultat vaut `null`.
+
+Vérification:: Inspection — `DefaultLoanAdviceCalculationService.compute()`, bloc de
+validation du taux `market`. Aucun test dédié actuellement.
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+[#MFB-CRE-RF-006]
+==== MFB-CRE-RF-006 — Sélection de la meilleure alternative de placement liquide sans risque
+
+Parmi les `LiquidPlacementAlternative` fournies, seules celles dont le `bucket` vaut `"cash"` ou
+`"fondsEuros"` sont candidates, et seulement si leur `rateCorr` est strictement positif.
+L'alternative retenue est celle dont le rendement net (voir MFB-CRE-RF-007) est le plus élevé.
+Un bucket différent (ex. `"actions"`) n'est jamais retenu comme alternative au remboursement
+anticipé.
+
+Vérification:: Test — `DefaultLoanAdviceCalculationServiceComponentTest.riskyBucketIsNotAnAlternative()`
+(bucket `"actions"` ignoré, verdict `INCONNU`) ; comportement de sélection du meilleur taux
+vérifié par Inspection de `bestLiquidAlternative()` (aucun test ne compare plusieurs
+alternatives liquides entre elles).
+
+Amont:: RF-800 (modèle `LiquidPlacementAlternative`) et RF-801 (implémentation),
+doc/architecture/10-domaine-prets-suggestions.md.
+
+[#MFB-CRE-RF-007]
+==== MFB-CRE-RF-007 — Rendement net d'impôt de l'alternative « fondsEuros »
+
+Le rendement net retenu pour une alternative de bucket `"cash"` est son taux brut
+(`rateCorr`) inchangé. Pour le bucket `"fondsEuros"`, le rendement net est
+`rateCorr × (1 − flatTaxRate)` (fiscalité PFU appliquée).
+
+Vérification:: Test —
+`DefaultLoanAdviceCalculationServiceComponentTest.fondsEurosYieldIsNetOfFlatTax()` (6 % brut →
+4,2 % net avec `flatTaxRate` par défaut de 30 %).
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+=== Projection du capital restant dû et échéancier des prêts
+
+[#MFB-CRE-RF-008]
+==== MFB-CRE-RF-008 — Exclusion des prêts soldés du résultat de l'analyse
+
+Un prêt dont le capital restant dû projeté à la date de référence (MFB-CRE-RF-009) est inférieur
+ou égal à 0,005 € n'apparaît pas dans `LoanAdviceResultModel.loans()` : seuls les prêts en cours
+sont analysés.
+
+Vérification:: Inspection — `DefaultLoanAdviceCalculationService.compute()`, boucle
+`for (LoanInput loan : input.loans())` et son `continue` sur `crd <= EPSILON`. Confirmé
+indirectement par `DefaultLoanAdviceCalculationServiceComponentTest.emptyInput()` (liste de
+prêts vide → résultat vide), sans test dédié à un prêt soldé non vide en entrée.
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+[#MFB-CRE-RF-009]
+==== MFB-CRE-RF-009 — Projection du capital restant dû à une date cible
+
+`projectCrd(loan, target)` reproduit `projectLoanCrdToDate()` de `calculations.js` : un pas de
+calcul par mois, du mois de la date de référence du prêt (`startDate`) au mois de `target`
+inclus. À chaque pas, les intérêts du mois (`crd × rate / 12`) sont retranchés de la mensualité
+nette (`monthly − insurance`, plancher 0) pour obtenir le capital amorti ; si une date de fin
+(`endDate`) est atteinte ou dépassée dans la boucle, le capital restant dû est ramené à 0 à ce
+pas. Le résultat est arrondi à 2 décimales.
+
+NOTE: Si le prêt a une mensualité lissée (`stepDate` renseignée), la mensualité nette est
+recalculée après le mois de palier pour solder le capital à la date de fin (voir
+MFB-CRE-RF-012, règle identique à `paymentAfterStep()` de `calculations.js`).
+
+Vérification:: Test —
+`DefaultLoanAdviceCalculationServiceComponentTest.projectCrdSingleStep()` (une échéance de
+septembre appliquée sur un prêt référencé au 1er septembre, 150 000 € à 5 %, mensualité nette
+960 € → 149 665,00 €). Le cas avec `stepDate` n'est couvert par aucun test de ce dépôt.
+
+Amont:: SILO-156 (doc/architecture/21-plan-silotage.md) : `projectCrd` devient une méthode
+d'instance de `LoanAdviceCalculationService`, calcul inchangé par rapport à
+`calculations.js`.
+
+[#MFB-CRE-RF-010]
+==== MFB-CRE-RF-010 — Repli sur le capital restant dû brut si la date de référence est illisible
+
+Si `projectCrd()` est appelé sur un prêt dont `startDate` est absente ou illisible (voir
+MFB-CRE-RF-018), la projection est impossible et la méthode retourne le capital restant dû brut
+du prêt (`loan.crd()`), arrondi à 2 décimales, sans tenter de simulation. Un capital restant dû
+nul ou négatif retourne 0 sans tenter de lire `startDate`.
+
+Vérification:: Inspection — `DefaultLoanAdviceCalculationService.projectCrd()`, gardes
+`crd <= 0` et `start == null`. Aucun test dédié.
+
+Amont:: SILO-156 (doc/architecture/21-plan-silotage.md).
+
+[#MFB-CRE-RF-011]
+==== MFB-CRE-RF-011 — Calcul de l'échéancier restant d'un prêt
+
+Pour un prêt en cours, le moteur simule mois par mois l'amortissement du capital restant dû à
+la mensualité nette courante, jusqu'à extinction du capital ou jusqu'à une date de fin connue,
+pour produire la durée restante (`remainingMonths`) et le total des intérêts restants
+(`remainingInterest`). Si aucune date de fin n'est connue et que le capital ne s'amortit pas
+(mensualité nette inférieure aux intérêts mensuels), la simulation s'arrête sans résultat
+exploitable (voir MFB-CRE-RF-013).
+
+Vérification:: Test —
+`DefaultLoanAdviceCalculationServiceComponentTest.remainingScheduleAndIndemnity()`
+(253 mois restants, 92 446,07 € d'intérêts restants pour le prêt de référence).
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+[#MFB-CRE-RF-012]
+==== MFB-CRE-RF-012 — Prise en compte de la mensualité lissée dans l'échéancier
+
+Quand un prêt a une date de fin de palier (`stepDate`) et une date de fin (`endDate`) connues,
+la mensualité nette appliquée jusqu'au mois du palier est celle saisie (`monthly − insurance`) ;
+si le palier est déjà passé à la date de référence (0 mois restants avant le palier), la
+mensualité nette est immédiatement recalculée en annuité soldant le capital à la date de fin.
+Dans la simulation de l'échéancier (MFB-CRE-RF-011), la mensualité est recalculée en annuité au
+mois exact où le palier se termine, sur les échéances restantes jusqu'à la date de fin.
+
+Vérification:: Inspection — `DefaultLoanAdviceCalculationService.analyseLoan()`
+(calcul de `phase1Months` et recalcul de `netPayment` par `annuity()`) et `simulate()`
+(recalcul au mois `phase1Months`). Aucun test de ce dépôt ne couvre un prêt à mensualité
+lissée (`stepDate` renseignée) : à ajouter.
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+[#MFB-CRE-RF-013]
+==== MFB-CRE-RF-013 — Horizon indéterminé sans amortissement ni date de fin
+
+Si la mensualité nette d'un prêt ne couvre pas les intérêts mensuels courants et qu'aucune date
+de fin n'est connue pour ce prêt, la durée restante et les intérêts restants du résultat
+(`LoanItem.remainingMonths()`, `LoanItem.remainingInterest()`) valent `null` : l'horizon est
+jugé indéterminé plutôt que de produire une estimation non fiable.
+
+Vérification:: Inspection — `DefaultLoanAdviceCalculationService.simulate()`, branche
+`principal <= 0` avec `hasEnd == false` (retourne `horizonKnown = false`), répercutée dans
+`analyseLoan()` (`schedule.horizonKnown() ? schedule.months() : null`). Aucun test dédié dans ce
+dépôt.
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+=== Conseil de remboursement anticipé
+
+[#MFB-CRE-RF-014]
+==== MFB-CRE-RF-014 — Calcul de l'indemnité de remboursement anticipé plafonnée
+
+L'indemnité de remboursement anticipé (IRA) d'un prêt est estimée à
+`crd × min(rate / 2, 3 %)` : plafonnée au moindre de 6 mois d'intérêts au taux du prêt et de 3 %
+du capital restant dû (hypothèse « prêt immobilier »).
+
+Vérification:: Test —
+`DefaultLoanAdviceCalculationServiceComponentTest.remainingScheduleAndIndemnity()`
+(IRA de 3 741,63 € pour le prêt de référence à 150 000 €, 5 %).
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+[#MFB-CRE-RF-015]
+==== MFB-CRE-RF-015 — Verdict de remboursement anticipé selon l'écart coût / rendement
+
+Le coût effectif du prêt (`rate + assurance annuelle / crd`) est comparé au rendement net de
+la meilleure alternative liquide (MFB-CRE-RF-006). Sans alternative connue, le verdict est
+`INCONNU`. Si l'écart dépasse la marge configurée (`repayMarginRate`), le verdict est
+`REMBOURSER` (sous réserve de MFB-CRE-RF-016) ; si l'écart est inférieur à l'opposé de cette
+marge, le verdict est `CONSERVER` ; dans l'intervalle, le verdict est `NEUTRE` (écart jugé trop
+faible pour trancher sur les seuls taux).
+
+Vérification:: Test —
+`DefaultLoanAdviceCalculationServiceComponentTest.repayWhenLoanCostsMoreThanCashYield()`
+(prêt à 5 % contre livret à 2 % → `REMBOURSER`) et `.keepWhenSavingsYieldMore()` (prêt à 5 %
+contre livret à 6 % → `CONSERVER`). Le verdict `NEUTRE` par écart faible n'est couvert par
+aucun test de ce dépôt.
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+[#MFB-CRE-RF-016]
+==== MFB-CRE-RF-016 — Neutralisation du remboursement si l'indemnité n'est pas amortie
+
+Même quand l'écart de coût justifierait un verdict `REMBOURSER` (MFB-CRE-RF-015), le verdict est
+ramené à `NEUTRE` si le nombre de mois nécessaires pour amortir l'indemnité de remboursement
+anticipé par l'économie annuelle dépasse la durée restante connue du prêt.
+
+Vérification:: Inspection — `DefaultLoanAdviceCalculationService.repaymentAdvice()`, condition
+`payback != null && remainingMonths != null && payback > remainingMonths`. Aucun test de ce
+dépôt n'exerce ce cas particulier.
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+=== Conseil de renégociation
+
+[#MFB-CRE-RF-017]
+==== MFB-CRE-RF-017 — Verdict de renégociation selon l'écart de taux, l'éligibilité et la rentabilité
+
+Sans taux de marché résolu (MFB-CRE-RF-004/005), le verdict est `INCONNU`. Si l'écart entre le
+taux du prêt et le taux de marché est inférieur au seuil `renegotiationMinGapRate`, le verdict
+est `TAUX_PROCHE_MARCHE`. Si la durée restante ou les intérêts restants du prêt sont indéterminés
+(MFB-CRE-RF-013), ou si le capital restant dû est inférieur à `renegotiationMinCrd`, ou si la
+durée restante est inférieure à `renegotiationMinRemainingMonths`, le verdict est
+`NON_ELIGIBLE`. Sinon, l'économie nette est estimée à durée restante identique (intérêts
+restants actuels moins intérêts au taux de marché, moins indemnité de remboursement anticipé et
+frais fixes estimés) : le verdict est `RENEGOCIER` si cette économie nette est positive, sinon
+`NON_RENTABLE`.
+
+NOTE: Aucun test automatisé de ce dépôt n'exerce actuellement le calcul de renégociation (les
+tests de composant existants laissent `marketRate` à `null`, branche `INCONNU` uniquement) : à
+compléter.
+
+Vérification:: Inspection — `DefaultLoanAdviceCalculationService.renegotiationAdvice()`
+(ensemble des branches `RenegotiationVerdict`).
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+=== Lecture des dates et arrondis de sortie
+
+[#MFB-CRE-RF-018]
+==== MFB-CRE-RF-018 — Lecture des dates au format ISO jour ou mois
+
+`parseDate(text)` lit une date au format `yyyy-MM-dd` ; si ce format échoue, elle tente le
+format `yyyy-MM` (année-mois, ramené au premier jour du mois). Un texte `null`, vide ou ne
+correspondant à aucun des deux formats retourne `null` sans lever d'exception.
+
+Vérification:: Inspection — `DefaultLoanAdviceCalculationService.parseDate()`. Exercé
+indirectement par `projectCrdSingleStep()` (date `"2026-09-01"` au format jour) ; le format
+année-mois et le cas de texte illisible ne sont couverts par aucun test de ce dépôt.
+
+Amont:: SILO-156 (doc/architecture/21-plan-silotage.md).
+
+[#MFB-CRE-RF-019]
+==== MFB-CRE-RF-019 — Arrondi des montants et taux de sortie
+
+Tous les montants exposés dans `LoanAdviceResultModel` (capital, mensualité, assurance,
+intérêts, indemnité, économies, coûts) sont arrondis à 2 décimales ; tous les taux (coût
+effectif, rendement, écarts) sont arrondis à 6 décimales. L'arrondi utilisé est
+`RoundingMode.HALF_UP` dans les deux cas.
+
+Vérification:: Inspection — méthodes utilitaires `money()` et `rate()` de
+`DefaultLoanAdviceCalculationService`. Valeurs arrondies vérifiées par tolérance numérique dans
+l'ensemble des tests de `DefaultLoanAdviceCalculationServiceComponentTest` (constante `EUR`).
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+=== Hypothèses modifiables de l'analyse
+
+[#MFB-CRE-RF-020]
+==== MFB-CRE-RF-020 — Hypothèses en vigueur : enregistrées sinon valeurs par défaut
+
+`LoanAdviceSettingsService.current()` retourne les hypothèses enregistrées par
+`LoanAdviceSettingsStore` si elles existent, sinon les valeurs par défaut
+(`LoanAdviceParameters.defaults(null)`, voir MFB-CRE-RF-003). `defaults()` retourne toujours les
+valeurs par défaut sans taux de marché, indépendamment de ce qui est enregistré.
+
+Vérification:: Test —
+`DefaultLoanAdviceSettingsServiceTest.defaultsWhenNothingSaved()` et
+`.savedValuesOverrideDefaults()`.
+
+Amont:: Aucune (exigence propre à ce dépôt).
+
+[#MFB-CRE-RF-021]
+==== MFB-CRE-RF-021 — Validation des hypothèses avant enregistrement
+
+`LoanAdviceSettingsService.save()` valide chaque champ avant tout enregistrement et lève une
+`IllegalArgumentException` au premier champ invalide, avec un message explicite, sans rien
+enregistrer : taux de marché (si renseigné) dans `]0 % ; 30 %]`, écart de remboursement et écart
+minimal de renégociation dans `[0 % ; 5 %]`, capital restant dû minimal et frais fixes de
+renégociation dans `[0 € ; 10 000 000 €]`, durée restante minimale de renégociation dans
+`[0 ; 600]` mois, fiscalité dans `[0 % ; 100 %]`. Les valeurs aux bornes de chaque plage sont
+acceptées.
+
+Vérification:: Test —
+`DefaultLoanAdviceSettingsServiceTest.invalidValuesAreRejected()` (une valeur hors plage par
+champ, message non vide, aucun enregistrement) et `.boundariesAreAccepted()` (bornes basses et
+hautes de chaque plage acceptées en une seule hypothèse chacune).
+
+Amont:: Aucune (exigence propre à ce dépôt).
+
+=== Persistance et cycle de vie des prêts
+
+[#MFB-CRE-RF-022]
+==== MFB-CRE-RF-022 — Création ou mise à jour d'un prêt avec valeurs par défaut
+
+`LoanWriter.saveLoanRow(body)` crée un nouveau prêt ou remplace un prêt existant de même
+identifiant. Si `body` ne fournit pas d'identifiant (ou un identifiant vide), un identifiant est
+généré (`"pat_" + 8 premiers caractères d'un UUID`). Les valeurs par défaut en l'absence du
+champ dans `body` sont : libellé `"Nouveau prêt"`, capital restant dû, taux, mensualité et
+assurance à 0, date de début `"2026-01-01"`, date de fin `"2046-01-01"`. Les champs optionnels du
+contrat bancaire (`initialAmount`, `totalInstallments`, `stepDate`) restent absents (`null`)
+tant qu'ils ne sont pas saisis ; une `stepDate` vide est aussi traitée comme absente. La ligne
+enregistrée est renvoyée telle quelle (mêmes valeurs, y compris celles par défaut).
+
+Vérification:: Inspection — `JpaLoanStore.saveLoanRow()`. Aucun test de ce dépôt n'exerce ce
+port (le seul consommateur, le `server` applicatif, est hors périmètre) : un test de composant
+dédié à `JpaLoanStore` serait à ajouter.
+
+Amont:: DB-041 (Javadoc de `LoanWriter`, parité documentée avec l'ancienne mutation générique
+`savePatrimoineRow("loans", ...)` du dépôt MyFamilyBudget).
+
+[#MFB-CRE-RF-023]
+==== MFB-CRE-RF-023 — Suppression d'un prêt
+
+`LoanWriter.deleteLoanRow(id)` retire de la liste des prêts celui dont l'identifiant correspond,
+sans erreur si aucun prêt ne correspond à cet identifiant.
+
+Vérification:: Inspection — `JpaLoanStore.deleteLoanRow()`. Aucun test de ce dépôt n'exerce ce
+port.
+
+Amont:: DB-041 (Javadoc de `LoanWriter`).
+
+[#MFB-CRE-RF-024]
+==== MFB-CRE-RF-024 — Remplacement intégral et réinitialisation des prêts
+
+`LoanSnapshotWriter.replace(loans)` remplace l'intégralité des prêts par la liste fournie ; une
+liste `null` est traitée comme une liste vide (tous les prêts sont supprimés).
+`LoanSnapshotWriter.reset()` supprime tous les prêts, sans condition.
+
+Vérification:: Inspection — `JpaLoanStore.replace()` et `.reset()`. Aucun test de ce dépôt
+n'exerce ce port (consommé par l'import/réinitialisation globale de MyFamilyBudget, hors
+périmètre).
+
+Amont:: SILO-119, lot B1 (Javadoc de `LoanSnapshotWriter` et de `JpaLoanStore`).
+
+[#MFB-CRE-RF-025]
+==== MFB-CRE-RF-025 — Rejet silencieux des prêts sans identifiant lors d'une écriture
+
+Lors de toute réécriture de la table des prêts (`saveLoanRow`, `deleteLoanRow`, `replace`,
+`reset`), un prêt sans identifiant dans la liste à écrire n'est pas recopié dans la table ; le
+nombre de prêts ignorés est journalisé en avertissement, sans lever d'exception.
+
+Vérification:: Inspection — `JpaLoanStore.rewrite()` (filtrage `loan.id() != null` et
+`LOG.warn`). Aucun test de ce dépôt n'exerce ce cas.
+
+Amont:: SILO-214, lot B (Javadoc de `JpaLoanStore`).
+
+[#MFB-CRE-RF-026]
+==== MFB-CRE-RF-026 — Restitution des prêts dans l'ordre de saisie
+
+`LoanReader.getLoans()` restitue les prêts triés par leur position d'enregistrement
+(`findAllByOrderByPositionAsc()`), c'est-à-dire dans l'ordre où ils ont été écrits par la
+dernière réécriture complète de la table (`rewrite()` réassigne les positions de façon contiguë
+à chaque écriture).
+
+Vérification:: Inspection — `CreditLoanRepository.findAllByOrderByPositionAsc()` et
+`JpaLoanStore.rewrite()` (positions réassignées via `CreditLoanEntityMapper.toEntities()`).
+Aucun test de ce dépôt n'exerce ce port.
+
+Amont:: SILO-214, lot B / DB-1040 (champ `position` de `CreditLoanEntity`).
+
+[#MFB-CRE-RF-027]
+==== MFB-CRE-RF-027 — Publication d'un événement après chaque écriture des prêts
+
+Après chaque écriture réussie des prêts (`saveLoanRow`, `deleteLoanRow`, `replace`, `reset`), un
+`LoansMutatedEvent` est publié, portant la nature de la mutation
+(`"saveLoanRow"`, `"deleteLoanRow"`, `"replace"` ou `"reset"`).
+
+Vérification:: Inspection — `JpaLoanStore.publishMutated()`, appelé après chacune des quatre
+opérations d'écriture. Aucun test de ce dépôt ne vérifie la publication effective de
+l'événement (écoute hors périmètre, côté composition root du dépôt MyFamilyBudget).
+
+Amont:: SILO-214, lot B (Javadoc de `LoansMutatedEvent` et de `JpaLoanStore`).
+
+=== Persistance des hypothèses de l'analyse
+
+[#MFB-CRE-RF-028]
+==== MFB-CRE-RF-028 — Persistance et relecture des hypothèses sans perte de précision
+
+Les hypothèses enregistrées par `LoanAdviceSettingsStore.save()` sont relues à l'identique par
+`load()` (égalité de valeur), y compris en l'absence de taux de marché (`null` préservé à
+l'aller-retour). La sérialisation passe par un JSON explicite (montants et taux en chaînes de
+caractères décimales, `BigDecimal.toPlainString()`) indépendant de la configuration Jackson de
+l'application appelante.
+
+Vérification:: Test — `LoanAdviceSettingsCodecTest.roundTrip()` (aller-retour JSON direct, avec
+et sans taux de marché) et `JpaLoanAdviceSettingsStoreTest.loadExisting()` /`.save()` (aller-retour
+via le repository JPA, mocké).
+
+Amont:: Aucune (exigence propre à ce dépôt).
+
+[#MFB-CRE-RF-029]
+==== MFB-CRE-RF-029 — Repli sur l'absence d'hypothèses en cas de payload corrompu
+
+Si le contenu JSON enregistré des hypothèses est illisible ou s'il manque un champ obligatoire,
+`LoanAdviceSettingsStore.load()` retourne vide (comme s'il n'y avait pas d'hypothèses
+enregistrées, voir MFB-CRE-RF-020) plutôt que de propager une exception à l'appelant ; un
+avertissement est journalisé avec le détail de l'erreur.
+
+Vérification:: Test — `JpaLoanAdviceSettingsStoreTest.loadCorrupted()` et
+`LoanAdviceSettingsCodecTest.invalid()` (JSON invalide, objet vide, champ au mauvais type —
+toutes trois lèvent `IllegalStateException`, capturée par `JpaLoanAdviceSettingsStore.load()`).
+
+Amont:: Aucune (exigence propre à ce dépôt).
+
+=== Exigences non fonctionnelles
+
+[#MFB-CRE-NRF-001]
+==== MFB-CRE-NRF-001 — `credit-api` sans dépendance externe
+
+Le module `credit-api` ne déclare aucune dépendance de compilation (ni Spring, ni JPA, ni
+OpenAPI, ni vers un autre module du réacteur applicatif `PersistenceManager`/`BudgetDataModel`) :
+seul le JDK est utilisé en production. Les tests du silo vivent dans `credit-core`.
+
+Vérification:: Inspection — `credit-api/pom.xml` (aucune section `<dependencies>`).
+
+Amont:: SILO-156 (commentaire de `credit-api/pom.xml`).
+
+[#MFB-CRE-NRF-002]
+==== MFB-CRE-NRF-002 — `credit-core` limité à ses dépendances internes déclarées
+
+Le module `credit-core` ne dépend que de `credit-api`, `infra-jpa` (configuration JPA commune),
+`jackson-databind` et `slf4j-api` en production (JUnit, AssertJ et Mockito en test uniquement).
+
+Vérification:: Inspection — `credit-core/pom.xml`, section `<dependencies>`.
+
+Amont:: SILO-156 / SILO-214 (commentaire de `credit-core/pom.xml`).
+
+[#MFB-CRE-NRF-003]
+==== MFB-CRE-NRF-003 — Moteur de calcul sans état et sans accès à la persistance
+
+`DefaultLoanAdviceCalculationService` ne référence aucun repository, aucune entité JPA et ne
+conserve aucun état entre deux appels : toutes les données nécessaires à `compute()` lui
+parviennent par `LoanAdviceInput`.
+
+Vérification:: Inspection — code de `DefaultLoanAdviceCalculationService` (aucun champ
+d'instance mutable, aucune dépendance vers le package `persistence`).
+
+Amont:: RF-801 (doc/architecture/10-domaine-prets-suggestions.md).
+
+[#MFB-CRE-NRF-004]
+==== MFB-CRE-NRF-004 — Modularité JPMS explicite de `credit-api`
+
+`credit-api` déclare un `module-info.java` qui exporte exactement les trois packages publics du
+contrat (`calculation`, `model`, `port`).
+
+Vérification:: Inspection — `credit-api/src/main/java/module-info.java`.
+
+Amont:: Aucune (exigence propre à ce dépôt).
+
+[#MFB-CRE-NRF-005]
+==== MFB-CRE-NRF-005 — `credit-core` sans `module-info` (décision D3)
+
+`credit-core` ne déclare pas de `module-info.java` : sa visibilité est tenue par le graphe Maven
+(seul le composition root `server` le référence ; `application` ne dépend que de `credit-api`)
+et par des règles ArchUnit, toutes deux définies et vérifiées côté MyFamilyBudget.
+
+Vérification:: Inspection (absence du fichier dans ce dépôt) + Analyse, hors périmètre de ce
+dépôt, côté MyFamilyBudget (règle ArchUnit de graphe de modules, analogue à
+`MavenModuleGraphTest`/`APPLICATION_DOES_NOT_USE_ANALYSIS_CORE` d'autres silos).
+
+Amont:: Décision D3 (citée dans le commentaire de `credit-core/pom.xml` ; document de décision
+non présent dans ce dépôt).
+
+[#MFB-CRE-NRF-006]
+==== MFB-CRE-NRF-006 — Versionnage SemVer strict
+
+Les deux modules du dépôt suivent SemVer 2.0.0 strict (`x.y.z` en continu
+`-SNAPSHOT`, publié sans suffixe à chaque tag `v*`) ; aucune dépendance de ce dépôt ni de ses
+consommateurs ne doit utiliser de plage de versions ou les qualificatifs `LATEST`/`RELEASE`.
+
+Vérification:: Inspection — `pom.xml` racine (`<version>`) et `README.md` (section
+« Processus de release »).
+
+Amont:: Aucune (exigence propre à ce dépôt).
+
+[#MFB-CRE-NRF-007]
+==== MFB-CRE-NRF-007 — Compatibilité binaire contrôlée par japicmp
+
+Le plugin `japicmp-maven-plugin` est configuré (`onlyModified`, `breakBuildOnBinaryIncompatibleModifications`,
+`ignoreMissingClasses`) en gestion de plugins du `pom.xml` racine, pour détecter toute
+incompatibilité binaire introduite dans `credit-api` ou `credit-core` entre deux versions.
+
+Vérification:: Analyse — exécution de `japicmp-maven-plugin` en CI (`mvn clean verify`,
+`ci.yml`) comparant le jar courant à la dernière version publiée.
+
+Amont:: Aucune (exigence propre à ce dépôt).
+
+[#MFB-CRE-NRF-008]
+==== MFB-CRE-NRF-008 — Cycle de publication continue en SNAPSHOT et garde-fous de release
+
+Chaque push sur `main` republie le SNAPSHOT courant sur GitHub Packages (job
+`publish-snapshot`), sans effet si la version n'est pas un SNAPSHOT. La création d'un tag `v*`
+échoue explicitement si le `pom.xml` racine est encore en SNAPSHOT, ou si sa version ne
+correspond pas exactement au tag (job `release`).
+
+Vérification:: Inspection — `.github/workflows/ci.yml`, jobs `publish-snapshot` et `release`
+(étape « Garde-fou - version stable et coherente avec le tag »).
+
+Amont:: Aucune (exigence propre à ce dépôt).
+
+[#MFB-CRE-NRF-009]
+==== MFB-CRE-NRF-009 — Précision du taux de prêt stockée sur 8 décimales
+
+Le taux d'un prêt (`CreditLoanEntity.rate`) est stocké avec une précision de 8 décimales
+(`numeric(19,8)`), au lieu des 2 décimales habituelles des montants, pour ne pas arrondir une
+valeur de taux saisie plus finement.
+
+Vérification:: Inspection — annotation `@Column(precision = 19, scale = 8)` de
+`CreditLoanEntity.rate` et `credit-core.changelog.xml`. Le test historique
+`RatePrecisionPersistenceTest` cité dans le Javadoc de `CreditLoanEntity` vivait dans le dépôt
+MyFamilyBudget avant l'extraction du silo et a depuis été retiré de ce dépôt-ci (hors
+périmètre) ; aucun test équivalent n'existe actuellement dans `myfamilybudget-domain-credit`.
+
+Amont:: DB-1040 (Javadoc de `CreditLoanEntity`).
+
+[#MFB-CRE-NRF-010]
+==== MFB-CRE-NRF-010 — Stockage texte des hypothèses, sans mécanisme `@Lob`
+
+`LoanAdviceSettingsEntity.payloadJson` est annoté `@JdbcTypeCode(SqlTypes.LONG32VARCHAR)`
+plutôt que `@Lob`, pour éviter le mécanisme Large Object de PostgreSQL (connexions non
+autocommit requises, cause de plantage au démarrage documentée ailleurs dans l'application).
+
+Vérification:: Inspection — annotation de `LoanAdviceSettingsEntity.payloadJson`.
+
+Amont:: Aucune citation directe ; renvoi croisé dans le Javadoc vers l'entité
+`BankImportDocumentEntity` du dépôt `myfamilybudget-domain-bank-pointage` (hors périmètre de ce
+dépôt).
+
+[#MFB-CRE-NRF-011]
+==== MFB-CRE-NRF-011 — Schéma de base géré par changelog Liquibase versionné
+
+Les tables `credit_loan` et `loan_advice_settings` sont créées par un changelog Liquibase
+dédié au module (`credit-core.changelog.xml`), généré sur une base neuve sans
+reverse-engineering de l'existant.
+
+Vérification:: Inspection — `credit-core/src/main/resources/db/changelog/credit-core/credit-core.changelog.xml`.
+
+Amont:: R-01, lot B (doc/architecture/24-backlog-reste-a-faire.md, DA-16 de
+doc/architecture/23-registre-decisions-actives.md du dépôt MyFamilyBudget).
+
+[#MFB-CRE-NRF-012]
+==== MFB-CRE-NRF-012 — Écritures sans verrou ni transaction propres à l'adaptateur
+
+`JpaLoanStore` ne porte ni annotation `@Transactional` ni verrou : ses méthodes supposent
+qu'elles sont appelées dans une transaction déjà ouverte et après la prise du verrou de mutation
+du silo Crédit par l'appelant, afin d'éviter la perte d'une modification concurrente lors de la
+réécriture complète de la table.
+
+Vérification:: Inspection — absence d'annotation `@Transactional` sur `JpaLoanStore` et son
+Javadoc de classe. La preuve que l'appelant ouvre effectivement la transaction et prend le
+verrou avant d'invoquer ce port est hors périmètre de ce dépôt (à vérifier côté MyFamilyBudget,
+`server`, mécanisme `MutationSilo.CREDIT`).
+
+Amont:: SILO-214, lot B (Javadoc de `JpaLoanStore`).

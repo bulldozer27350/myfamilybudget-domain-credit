@@ -6,6 +6,14 @@ d'autre consommateur : toute release ici n'a de sens que si elle est
 destinée à être référencée dans le BOM de l'application
 (`back/pom.xml`, property `<xxx.version>`).
 
+## Documentation des exigences
+
+Les exigences fonctionnelles et non fonctionnelles du silo Crédit sont formalisées dans
+[`doc/srs.adoc`](doc/srs.adoc) (Software Requirements Specification) ; l'interface entre ce
+silo et l'application MyFamilyBudget est formalisée dans [`doc/irs.adoc`](doc/irs.adoc)
+(Interface Requirements Specification). Ces deux fragments AsciiDoc sont destinés à être inclus
+par le document maître applicatif de MyFamilyBudget.
+
 ## Principes
 
 - Versionnage SemVer strict `x.y.z`, jamais de ranges ni de `LATEST`/`RELEASE`.

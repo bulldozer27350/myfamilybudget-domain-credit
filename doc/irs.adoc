@@ -1,0 +1,360 @@
+////
+Fragment AsciiDoc destiné à être inclus par le document maître applicatif de MyFamilyBudget via
+include::{...}/myfamilybudget-domain-credit/doc/irs.adoc[leveloffset=+N], N étant ajusté par ce
+document maître. Ne pas transformer ce fichier en document autonome (pas de titre de niveau 0).
+////
+
+== Silo Crédit — Interface avec l'application MyFamilyBudget (IRS)
+
+=== Conventions
+
+Les identifiants de ce document suivent la convention commune à l'ensemble de l'application
+MyFamilyBudget (préfixe `MFB-`, commun aux 11 dépôts satellites) :
+
+* `MFB-CRE-INT-nnn` : exigence d'interface entre ce dépôt (silo Crédit) et l'application
+  MyFamilyBudget (modules `application` et `server` du dépôt principal).
+* `nnn` est un numéro séquentiel sur 3 chiffres, sans trou ni réutilisation.
+
+Chaque exigence précise comment elle peut être prouvée, selon la nomenclature suivante :
+
+* *Inspection* : lecture directe d'un artefact (code, `pom.xml`, configuration, type Java) sans
+  exécution.
+* *Analyse* : raisonnement ou outillage statique sur le code ou le compilé (graphe de
+  dépendances, comparaison binaire type japicmp, règle d'architecture type ArchUnit), sans
+  exercer le comportement avec des données représentatives.
+* *Démonstration* : exécution de l'ensemble ou du pipeline en conditions représentatives,
+  observation qualitative, sans assertion exhaustive sur des données de test précises.
+* *Test* : exécution contrôlée avec des données connues, comparaison quantitative du résultat à
+  un résultat attendu.
+
+Pour toute exigence dont la preuve dépend du code de l'application appelante (traduction REST,
+câblage Spring, écoute d'événement après commit), le champ Vérification:: le précise
+explicitement : cette preuve est hors du périmètre de ce dépôt et doit être apportée dans le
+dépôt `MyFamilyBudget`.
+
+=== Nature de l'interface et répartition des dépendances
+
+[#MFB-CRE-INT-001]
+==== MFB-CRE-INT-001 — Appel Java synchrone intra-JVM, sans REST ni file de messages
+
+Le silo Crédit n'expose aucun endpoint REST, aucune file de messages, aucune API réseau : toute
+communication avec l'application MyFamilyBudget passe par des appels de méthode Java
+synchrones, dans la même JVM que le composition root `server`, sur les interfaces publiées par
+`credit-api` (`LoanAdviceCalculationService`, `LoanAdviceSettingsService`, `LoanReader`,
+`LoanWriter`, `LoanSnapshotWriter`, `LoanAdviceSettingsStore`).
+
+Vérification:: Inspection — `credit-api/src/main/java/module-info.java` (aucun package HTTP/
+réseau exporté) et absence de toute dépendance Spring Web/WebFlux dans `credit-api/pom.xml` et
+`credit-core/pom.xml`.
+
+Amont:: SILO-156 (doc/architecture/21-plan-silotage.md, dépôt MyFamilyBudget).
+
+[#MFB-CRE-INT-002]
+==== MFB-CRE-INT-002 — Répartition des dépendances entre `application` (contrat) et `server` (implémentation)
+
+Le module `application` de MyFamilyBudget (couche de traduction HTTP) ne doit dépendre que de
+`credit-api` : il manipule l'interface `LoanAdviceCalculationService` et les modèles associés,
+jamais `DefaultLoanAdviceCalculationService` ni le package `credit.core.persistence`. Le
+composition root `server` est seul à dépendre de `credit-core` : il câble l'implémentation du
+moteur (bean déclaré, pas un `@Component` scanné) et bénéficie du scan Spring par défaut pour
+les classes `@Component`/`@Repository` de persistance (`JpaLoanStore`,
+`JpaLoanAdviceSettingsStore`, `CreditLoanRepository`, `LoanAdviceSettingsRepository`), qui
+partagent le préfixe de package `com.moe.myfamilybudget` scanné depuis la racine de
+l'application.
+
+Vérification:: Analyse, hors périmètre de ce dépôt — règle de graphe de dépendances côté
+MyFamilyBudget (`server`), analogue à `MavenModuleGraphTest` ou à une règle ArchUnit
+`APPLICATION_DOES_NOT_USE_CREDIT_CORE` déjà en place pour d'autres silos (ex. Analyse). Ici,
+Inspection des commentaires de `credit-api/pom.xml` et `credit-core/pom.xml`, qui documentent
+cette répartition attendue mais ne peuvent la faire respecter côté consommateur.
+
+Amont:: SILO-156 / SILO-214 (commentaires de `credit-api/pom.xml` et `credit-core/pom.xml`).
+
+=== Modèle de données en entrée — analyse des prêts
+
+[#MFB-CRE-INT-003]
+==== MFB-CRE-INT-003 — Contrat d'entrée `LoanAdviceInput`
+
+[cols="1,2,3", options="header"]
+|===
+| Champ | Type | Règle / défaut
+
+| `loans`
+| `List<LoanInput>`
+| `null` → liste vide (voir MFB-CRE-RF-001)
+
+| `alternatives`
+| `List<LiquidPlacementAlternative>`
+| `null` → liste vide (voir MFB-CRE-RF-001)
+
+| `parameters`
+| `LoanAdviceParameters`
+| `null` → `LoanAdviceParameters.defaults(null)` (voir MFB-CRE-RF-001, MFB-CRE-RF-003)
+
+| `marketRate`
+| `BigDecimal` (fraction), nullable
+| Prime sur `parameters.marketRate()` si renseigné (voir MFB-CRE-RF-004)
+
+| `today`
+| `LocalDate`, obligatoire
+| `null` interdit : `NullPointerException` à la construction (voir MFB-CRE-RF-002)
+|===
+
+Chaque `LoanInput` transporte : `id`, `label` (`String`), `crd`, `rate`, `monthly`, `insurance`
+(`BigDecimal`, non arrondis en entrée), `startDate`, `endDate`, `stepDate` (`String`, format ISO
+`yyyy-MM-dd` ou `yyyy-MM`, `endDate`/`stepDate` nullable). `initialAmount` et
+`totalInstallments` de `LoanModel` ne font volontairement pas partie de `LoanInput` : le moteur
+ne les utilise pas.
+
+Chaque `LiquidPlacementAlternative` transporte : `label` (`String`, `null` → chaîne vide),
+`rateCorr` (`BigDecimal`, fraction, nullable), `bucket` (`String`, `null` → chaîne vide ; seuls
+`"cash"` et `"fondsEuros"` sont significatifs pour le moteur, voir MFB-CRE-RF-006).
+
+Vérification:: Inspection — déclarations des records `LoanAdviceInput`, `LoanInput`,
+`LiquidPlacementAlternative` (`credit-api`).
+
+Amont:: RF-800 (doc/architecture/10-domaine-prets-suggestions.md, dépôt MyFamilyBudget).
+
+=== Modèle de données en sortie — résultat de l'analyse
+
+[#MFB-CRE-INT-004]
+==== MFB-CRE-INT-004 — Contrat de résultat `LoanAdviceResultModel`
+
+[cols="1,2,3", options="header"]
+|===
+| Champ | Type | Règle
+
+| `marketRateUsed`
+| `BigDecimal`, nullable
+| Taux de marché effectivement retenu, arrondi 6 décimales ; `null` si non renseigné ou rejeté
+  (voir MFB-CRE-RF-005)
+
+| `marketRateSource`
+| `String`, nullable
+| Jamais renseigné par le moteur lui-même (toujours `null` en sortie de `compute()`) ; assigné
+  a posteriori par l'appelant via `withMarketRateSource(String)` (voir MFB-CRE-INT-007)
+
+| `assumptions`
+| `Assumptions`
+| Hypothèses effectivement appliquées à l'analyse, à afficher à côté des résultats (voir
+  MFB-CRE-RF-003)
+
+| `loans`
+| `List<LoanItem>`
+| Un élément par prêt en cours (voir MFB-CRE-RF-008) ; voir table ci-dessous
+
+| `notes`
+| `List<String>`
+| Limites générales de l'estimation, toujours au moins deux entrées (hypothèses IRA et
+  alternative sans risque), une troisième si un taux de marché est retenu
+|===
+
+`LoanItem` transporte, par prêt : `id`, `label` (recopiés de l'entrée), `crd`, `rate`,
+`monthly`, `insurance` (arrondis, voir MFB-CRE-RF-019), `remainingMonths` (`Integer`, nullable,
+voir MFB-CRE-RF-013), `remainingInterest` (`BigDecimal`, nullable, même condition),
+`earlyRepaymentIndemnity` (`BigDecimal`, voir MFB-CRE-RF-014), `repayment`
+(`RepaymentAdvice`) et `renegotiation` (`RenegotiationAdvice`).
+
+`RepaymentAdvice` transporte : `verdict` (énumération `RepayVerdict` :
+`REMBOURSER`/`NEUTRE`/`CONSERVER`/`INCONNU`, voir MFB-CRE-RF-015/016), `loanEffectiveCost`,
+`alternativeNetYield` (nullable), `alternativeLabel` (nullable), `annualSaving` (nullable),
+`indemnityPaybackMonths` (`Integer`, nullable) et `reason` (`String`, texte explicatif en
+français, non contractuel pour l'intégration mais destiné à l'affichage direct).
+
+`RenegotiationAdvice` transporte : `verdict` (énumération `RenegotiationVerdict` :
+`RENEGOCIER`/`NON_RENTABLE`/`TAUX_PROCHE_MARCHE`/`NON_ELIGIBLE`/`INCONNU`, voir
+MFB-CRE-RF-017), `gapRate` (nullable), `newMonthly`, `monthlyGain`, `grossSaving`, `costs`,
+`netSaving`, `paybackMonths` (`Integer`, nullable) — tous nullables sauf `verdict` dès que le
+verdict n'est pas `RENEGOCIER`/`NON_RENTABLE`, et `reason` (`String`).
+
+Vérification:: Inspection — déclarations des records imbriqués de `LoanAdviceResultModel`
+(`credit-api`).
+
+Amont:: Aucune (modèle propre à ce dépôt).
+
+=== Modèle de données échangé via les ports de persistance
+
+[#MFB-CRE-INT-005]
+==== MFB-CRE-INT-005 — Modèle `LoanModel` échangé par `LoanReader`/`LoanWriter`/`LoanSnapshotWriter`
+
+[cols="1,2,3", options="header"]
+|===
+| Champ | Type | Règle / défaut à l'écriture (`saveLoanRow`)
+
+| `id`
+| `String`
+| Généré si absent (voir MFB-CRE-RF-022) ; obligatoire pour être conservé par une réécriture
+  complète (voir MFB-CRE-RF-025)
+
+| `label`
+| `String`
+| Défaut `"Nouveau prêt"`
+
+| `crd`, `rate`, `monthly`, `insurance`
+| `BigDecimal`
+| Défaut `0` (voir MFB-CRE-RF-022) ; `rate` stocké sur 8 décimales (voir MFB-CRE-NRF-009)
+
+| `startDate`
+| `String`
+| Défaut `"2026-01-01"`
+
+| `endDate`
+| `String`
+| Défaut `"2046-01-01"`
+
+| `initialAmount`
+| `BigDecimal`, nullable
+| Absent tant que non saisi (information de contrat bancaire, non consommée par le moteur)
+
+| `totalInstallments`
+| `Integer`, nullable
+| Absent tant que non saisi (idem)
+
+| `stepDate`
+| `String`, nullable
+| Absent tant que non saisi ; une valeur vide est normalisée en absence
+|===
+
+`LoanWriter.saveLoanRow(Map<String,Object> body)` et son retour utilisent un
+`Map<String, Object>` générique plutôt qu'un type fortement typé : c'est le format de frontière
+hérité de l'ancienne mutation générique du hub applicatif (`savePatrimoineRow`). La traduction
+entre le corps JSON de la requête REST applicative et ce `Map` est une responsabilité de
+l'application, hors périmètre de ce dépôt.
+
+Vérification:: Inspection — `LoanModel` (`credit-api`), `JpaLoanStore.saveLoanRow()`
+(`credit-core`) pour les valeurs par défaut. La traduction HTTP → `Map<String,Object>` est hors
+périmètre de ce dépôt (à vérifier côté MyFamilyBudget).
+
+Amont:: RF-B00 (Javadoc de `LoanReader`) / DB-1040 (Javadoc de `CreditLoanEntity`) / DB-041
+(Javadoc de `LoanWriter`).
+
+=== Responsabilités de traduction côté application
+
+[#MFB-CRE-INT-006]
+==== MFB-CRE-INT-006 — Assemblage de `LoanAdviceInput` à la charge de l'application
+
+La construction d'un `LoanAdviceInput` à partir de l'état budgétaire de l'utilisateur
+(extraction des prêts via `LoanReader`, résolution du bucket d'actif de chaque placement
+candidat en `LiquidPlacementAlternative`, choix du taux de marché à transmettre) est une
+responsabilité de traduction de l'application appelante : ce dépôt ne connaît ni
+`PlacementModel`, ni `AssetCategoryModel`, ni aucun modèle budgétaire plus large que
+`LoanAdviceInput` lui-même.
+
+Vérification:: Hors périmètre de ce dépôt — la preuve se trouve dans le dépôt MyFamilyBudget
+(assemblage réalisé typiquement par une factory applicative, ex. `LoanAdviceInputFactory`, non
+présente dans ce dépôt).
+
+Amont:: RF-800/RF-801 (doc/architecture/10-domaine-prets-suggestions.md, dépôt MyFamilyBudget).
+
+[#MFB-CRE-INT-007]
+==== MFB-CRE-INT-007 — Attribution de l'origine du taux de marché après calcul
+
+Le moteur ne renseigne jamais `marketRateSource` dans son résultat (toujours `null` en sortie de
+`compute()`, voir MFB-CRE-INT-004) : c'est à l'application d'appeler
+`LoanAdviceResultModel.withMarketRateSource(String)` après coup, avec l'origine réelle du taux
+qu'elle a transmis (paramètre de requête, saisie manuelle, source automatique telle que la
+Banque de France).
+
+Vérification:: Inspection — `LoanAdviceResultModel.withMarketRateSource()` (`credit-api`, ne
+fait que recopier les autres champs). L'appel effectif de cette méthode avec la bonne origine
+est hors périmètre de ce dépôt.
+
+Amont:: Aucune (exigence propre à ce dépôt).
+
+[#MFB-CRE-INT-008]
+==== MFB-CRE-INT-008 — Corps générique de `LoanWriter.saveLoanRow` à la charge de l'application
+
+La traduction entre le corps de la requête REST de création/modification d'un prêt côté
+application MyFamilyBudget et le `Map<String, Object>` attendu par
+`LoanWriter.saveLoanRow(Map<String,Object>)` (clés attendues : voir le tableau de
+MFB-CRE-INT-005) est une responsabilité de l'application, qui est seule à connaître le schéma
+OpenAPI exposé aux clients HTTP.
+
+Vérification:: Hors périmètre de ce dépôt — la preuve se trouve dans le dépôt MyFamilyBudget
+(couche REST / `application`, génération OpenAPI).
+
+Amont:: DB-041 / DB-050 (Javadoc de `LoanWriter`, retrait prévu du corps générique hors
+périmètre de ce dépôt).
+
+=== Contrat de build et de distribution
+
+[#MFB-CRE-INT-009]
+==== MFB-CRE-INT-009 — Coordonnées Maven et publication GitHub Packages
+
+Les artefacts `com.moe.myfamilybudget:credit-api` et `com.moe.myfamilybudget:credit-core`
+(version du `pom.xml` racine de ce dépôt) sont publiés sur GitHub Packages
+(`https://maven.pkg.github.com/bulldozer27350/myfamilybudget-domain-credit`). Ce dépôt importe
+le BOM centralisé `com.moe.myfamilybudget:myfamilybudget-bom` publié par le dépôt
+`MyFamilyBudget` (`https://maven.pkg.github.com/bulldozer27350/MyFamilyBudget`) pour aligner les
+versions de ses dépendances transitives partagées (Spring Boot, Jackson, JUnit...). Côté
+MyFamilyBudget, l'intégration se fait par une property dédiée du BOM applicatif référençant la
+version publiée de ce dépôt.
+
+Vérification:: Inspection — `pom.xml` racine de ce dépôt (sections `<repositories>` et
+`<distributionManagement>`). La property côté MyFamilyBudget (`back/pom.xml`) est hors périmètre
+de ce dépôt.
+
+Amont:: Aucune (exigence propre à ce dépôt ; processus documenté dans son `README.md`).
+
+[#MFB-CRE-INT-010]
+==== MFB-CRE-INT-010 — Visibilité JPMS du contrat exposé
+
+Seuls les packages `com.moe.myfamilybudget.domain.credit.calculation`,
+`com.moe.myfamilybudget.domain.credit.model` et `com.moe.myfamilybudget.domain.credit.port` sont
+exportés par le module `credit-api` et donc visibles d'un consommateur modulaire ; aucun type
+interne au moteur (`credit-core`, dépourvu de `module-info`) n'est exportable de cette façon
+(voir MFB-CRE-NRF-005).
+
+Vérification:: Inspection — `credit-api/src/main/java/module-info.java`.
+
+Amont:: Aucune (exigence propre à ce dépôt).
+
+=== Gestion des erreurs
+
+[#MFB-CRE-INT-011]
+==== MFB-CRE-INT-011 — Canal d'erreur de validation des hypothèses
+
+`LoanAdviceSettingsService.save()` signale une hypothèse invalide par une
+`IllegalArgumentException` non vérifiée (voir MFB-CRE-RF-021), explicitement documentée comme
+devant être traduite en réponse HTTP 400 par l'application appelante ; ce dépôt ne définit
+aucun code d'erreur ni enveloppe d'erreur HTTP, uniquement l'exception Java et son message.
+
+Vérification:: Inspection — Javadoc de `LoanAdviceSettingsService.save()`
+(`@throws IllegalArgumentException ... traduit en 400`) et de
+`DefaultLoanAdviceSettingsService.save()`. La traduction HTTP effective est hors périmètre de ce
+dépôt (à vérifier côté MyFamilyBudget, couche `application`/contrôleur REST).
+
+Amont:: Aucune (exigence propre à ce dépôt, mention « traduit en 400 » portée par le Javadoc du
+contrat).
+
+[#MFB-CRE-INT-012]
+==== MFB-CRE-INT-012 — Publication et écoute de `LoansMutatedEvent`
+
+`JpaLoanStore` publie un `LoansMutatedEvent` après chaque écriture réussie des prêts (voir
+MFB-CRE-RF-027). L'écoute de cet événement après le commit de la transaction en cours, pour
+déclencher le contrôle automatique des notifications, est câblée par le composition root
+`server` de MyFamilyBudget : ce dépôt ne porte aucun `@EventListener` et ne connaît pas ses
+consommateurs.
+
+Vérification:: Inspection — absence de `@EventListener` dans ce dépôt (publication seule). La
+preuve de l'écoute effective côté `server` est hors périmètre de ce dépôt.
+
+Amont:: SILO-214, lot B (Javadoc de `LoansMutatedEvent`).
+
+=== Règles de compatibilité et d'évolution
+
+[#MFB-CRE-INT-013]
+==== MFB-CRE-INT-013 — Compatibilité binaire et bump de version coordonné
+
+Toute modification binairement incompatible de `credit-api` ou `credit-core` est détectée en CI
+par `japicmp-maven-plugin` (voir MFB-CRE-NRF-007) et doit se traduire par un bump de version
+majeure selon SemVer (voir MFB-CRE-NRF-006). La mise à jour de la property correspondante dans
+le BOM applicatif (`back/pom.xml` de MyFamilyBudget) n'est effectuée qu'après confirmation que
+la nouvelle version a été validée par intégration côté MyFamilyBudget, jamais indépendamment
+(voir `README.md` de ce dépôt, section « Principes »).
+
+Vérification:: Analyse — exécution de `japicmp-maven-plugin` en CI pour la détection ;
+Inspection du `README.md` de ce dépôt pour la procédure de coordination. La mise à jour
+effective de la property côté BOM applicatif est hors périmètre de ce dépôt.
+
+Amont:: Aucune (exigence propre à ce dépôt).

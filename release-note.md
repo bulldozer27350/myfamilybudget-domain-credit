@@ -4,6 +4,30 @@ Toutes les versions publiées de ce dépôt respectent la spécification [SemVer
 
 ---
 
+## [0.0.2-SNAPSHOT] - En cours
+
+### Type de release
+**Documentation** (aucun changement de comportement métier)
+
+### Résumé
+Ajout de la Software Requirements Specification (`doc/srs.adoc`) et de l'Interface
+Requirements Specification (`doc/irs.adoc`) du silo Crédit, formalisant les exigences
+fonctionnelles, non fonctionnelles et d'interface déjà implémentées par `credit-api` et
+`credit-core`. Bump de version de développement continu vers `0.0.2-SNAPSHOT`.
+
+### Changements par composant
+- **`credit-api`** : aucun changement de code (uniquement le bump de version).
+- **`credit-core`** : aucun changement de code (uniquement le bump de version).
+- **Documentation** : `doc/srs.adoc` (29 exigences fonctionnelles, 12 exigences non
+  fonctionnelles) et `doc/irs.adoc` (13 exigences d'interface silo ↔ application
+  MyFamilyBudget).
+
+### Rétro-compatibilité & Compatibilité binaire
+Totale : aucune modification de code, uniquement de la documentation et un bump de version de
+développement continu.
+
+---
+
 ## [0.0.1] - 2026-11-07
 
 ### Type de release
